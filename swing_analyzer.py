@@ -237,8 +237,6 @@ def build_pose_canvas(frame, results, swing_sides: SwingSides):
         cv.circle(annotated, (x, y), 7, (0, 0, 0), -1, cv.LINE_AA)
         cv.circle(annotated, (x, y), 5, BRIGHT_POINT_COLOR, -1, cv.LINE_AA)
 
-    metrics = calculate_metrics(landmarks, swing_sides)
-    draw_metrics_panel(annotated, metrics, swing_sides)
     return annotated
 
 
@@ -286,16 +284,25 @@ def draw_text_box(image, text: str, origin: tuple[int, int]):
 
 
 def draw_metrics_panel(image, metrics: dict[str, Optional[float]], swing_sides: SwingSides):
+    height, width = image.shape[:2]
+    panel_width = 422
+    panel_height = 202
+    x1 = width - 18
+    y1 = 18
+    x0 = max(18, x1 - panel_width)
+    y2 = min(height - 18, y1 + panel_height)
+
     overlay = image.copy()
-    cv.rectangle(overlay, (18, 18), (440, 220), (0, 0, 0), -1)
+    cv.rectangle(overlay, (x0, y1), (x1, y2), (0, 0, 0), -1)
     cv.addWeighted(overlay, 0.48, image, 0.52, 0, image)
 
-    draw_text_box(image, f"Lead side: {swing_sides.lead}", (34, 52))
-    draw_text_box(image, f"Trail side: {swing_sides.trail}", (34, 82))
-    draw_text_box(image, f"Lead elbow: {format_angle(metrics['lead_elbow'])}", (34, 118))
-    draw_text_box(image, f"Trail elbow: {format_angle(metrics['trail_elbow'])}", (34, 148))
-    draw_text_box(image, f"Shoulder rotation: {format_angle(metrics['shoulder_rotation'])}", (34, 178))
-    draw_text_box(image, f"Hip rotation: {format_angle(metrics['hip_rotation'])}", (34, 208))
+    text_x = x0 + 16
+    draw_text_box(image, f"Lead side: {swing_sides.lead}", (text_x, 34))
+    draw_text_box(image, f"Trail side: {swing_sides.trail}", (text_x, 64))
+    draw_text_box(image, f"Lead elbow: {format_angle(metrics['lead_elbow'])}", (text_x, 100))
+    draw_text_box(image, f"Trail elbow: {format_angle(metrics['trail_elbow'])}", (text_x, 130))
+    draw_text_box(image, f"Shoulder rotation: {format_angle(metrics['shoulder_rotation'])}", (text_x, 160))
+    draw_text_box(image, f"Hip rotation: {format_angle(metrics['hip_rotation'])}", (text_x, 190))
 
 
 def format_angle(value: Optional[float]) -> str:
@@ -327,7 +334,7 @@ def process_video(input_path: Path, output_path: Path, model_path: Path, right_h
         if not first_ok:
             raise RuntimeError("Input video contains no frames")
 
-        output_size = (first_frame.shape[1], first_frame.shape[0])
+        output_size = (first_frame.shape[0], first_frame.shape[1])
         writer = open_writer(output_path, fps, output_size)
 
         try:
@@ -351,6 +358,10 @@ def process_video(input_path: Path, output_path: Path, model_path: Path, right_h
                     swing_sides = SwingSides(lead="left", trail="right")
 
                 annotated = build_pose_canvas(frame, result, swing_sides)
+                annotated = cv.rotate(annotated, cv.ROTATE_90_CLOCKWISE)
+                if result.pose_landmarks:
+                    metrics = calculate_metrics(result.pose_landmarks[0], swing_sides)
+                    draw_metrics_panel(annotated, metrics, swing_sides)
                 writer.write(annotated)
                 frame_index += 1
         finally:
