@@ -87,6 +87,19 @@ BRIGHT_LINE_COLOR = (0, 255, 255)
 BRIGHT_POINT_COLOR = (0, 255, 0)
 TEXT_COLOR = (255, 255, 255)
 TEXT_BG = (0, 0, 0)
+MAX_COACHING_TIPS = 3
+
+# --- Pose validation gate -------------------------------------------------
+# The gate checks for the one thing that actually characterizes a real golf swing pose:
+# the hands stay together on the grip. That single "arms together" check
+# catches mistracked limbs (the usual failure mode, especially on the lead
+# arm) without vetoing normal swing variation.
+POSE_VISIBILITY_THRESHOLD = 0.5
+POSE_MIN_BODY_SPAN = 0.02
+POSE_MAX_HAND_SEPARATION_MULTIPLIER = 0.9  # wrists should stay close together (hands on the grip)
+POSE_MAX_ELBOW_SEPARATION_MULTIPLIER = 3.0  # loose backstop sanity check on elbow spread
+
+TIP_CONFIRMATION_FRAMES = 3
 
 
 @dataclass(frozen=True)
@@ -95,9 +108,22 @@ class SwingSides:
     trail: str
 
 
+@dataclass
+class StickyTipTracker:
+    active_tips: tuple[str, ...] = ()
+
+    def update(self, candidate_tips: Optional[list[str]]) -> list[str]:
+        if not candidate_tips:
+            self.active_tips = ()
+            return list(self.active_tips)
+
+        self.active_tips = tuple(unique_tips(candidate_tips)[:MAX_COACHING_TIPS])
+        return list(self.active_tips)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Analyze a golf swing video with pose overlays.")
-    parser.add_argument("input_video", type=Path, help="Path to the iPhone swing video")
+    parser.add_argument("input_video", type=Path, help="Path to the Phone swing video")
     parser.add_argument(
         "--output",
         type=Path,
@@ -119,6 +145,12 @@ def parse_args() -> argparse.Namespace:
         "--left-handed",
         action="store_true",
         help="Force a left-handed swing interpretation",
+    )
+    parser.add_argument(
+        "--slowdown",
+        type=float,
+        default=1.0,
+        help="Playback slowdown factor. 1.0 keeps normal speed, 2.0 plays at half speed.",
     )
     return parser.parse_args()
 
@@ -187,6 +219,60 @@ def normalize_angle(angle: float) -> float:
     while angle > 180:
         angle -= 360
     return angle
+
+
+def distance_2d(a, b) -> float:
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def get_landmark_point(landmarks, landmark_index: int):
+    point = landmarks[landmark_index]
+    return point.x, point.y
+
+
+def assess_pose_quality(landmarks) -> bool:
+    """Lightweight gate: are the arms tracked in a plausible 'hands together
+    on the grip' configuration for a golf swing, rather than a full
+    biomechanical check on every joint.
+    """
+    key_indices = (
+        LEFT_SHOULDER,
+        RIGHT_SHOULDER,
+        LEFT_ELBOW,
+        RIGHT_ELBOW,
+        LEFT_WRIST,
+        RIGHT_WRIST,
+    )
+    if any(landmarks[index].visibility < POSE_VISIBILITY_THRESHOLD for index in key_indices):
+        return False
+
+    left_shoulder = get_landmark_point(landmarks, LEFT_SHOULDER)
+    right_shoulder = get_landmark_point(landmarks, RIGHT_SHOULDER)
+    left_elbow = get_landmark_point(landmarks, LEFT_ELBOW)
+    right_elbow = get_landmark_point(landmarks, RIGHT_ELBOW)
+    left_wrist = get_landmark_point(landmarks, LEFT_WRIST)
+    right_wrist = get_landmark_point(landmarks, RIGHT_WRIST)
+
+    shoulder_span = distance_2d(left_shoulder, right_shoulder)
+    if shoulder_span < POSE_MIN_BODY_SPAN:
+        return False
+
+    # Core check: the hands stay together on the grip through almost the
+    # entire swing, so the two wrists should sit close to each other
+    # relative to shoulder width. A large separation almost always means
+    # one wrist got mistracked (this is what was rejecting good lead-arm
+    # frames under the old, stricter gate).
+    wrist_span = distance_2d(left_wrist, right_wrist)
+    if wrist_span > shoulder_span * POSE_MAX_HAND_SEPARATION_MULTIPLIER:
+        return False
+
+    # Loose backstop so a wildly flailing elbow doesn't sneak through even
+    # when the wrists happen to line up.
+    elbow_span = distance_2d(left_elbow, right_elbow)
+    if elbow_span > shoulder_span * POSE_MAX_ELBOW_SEPARATION_MULTIPLIER:
+        return False
+
+    return True
 
 
 def pick_swing_sides(right_handed: Optional[bool], landmarks) -> SwingSides:
@@ -277,18 +363,81 @@ def calculate_metrics(landmarks, swing_sides: SwingSides) -> dict[str, Optional[
     }
 
 
+def derive_coaching_tips(metrics: dict[str, Optional[float]], swing_sides: SwingSides) -> list[str]:
+    tips: list[str] = []
+
+    lead_elbow = metrics["lead_elbow"]
+    trail_elbow = metrics["trail_elbow"]
+
+    if lead_elbow is not None:
+        if lead_elbow < 155:
+            tips.append(f"Keep your {swing_sides.lead} arm a little longer.")
+        elif lead_elbow > 175:
+            tips.append(f"Relax your {swing_sides.lead} arm a touch.")
+
+    if trail_elbow is not None:
+        if trail_elbow < 90:
+            tips.append(f"Let your {swing_sides.trail} arm extend a bit more.")
+        elif trail_elbow > 145:
+            tips.append(f"Let your {swing_sides.trail} arm fold naturally.")
+
+    return unique_tips(tips)[:MAX_COACHING_TIPS]
+
+
+def unique_tips(tips: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for tip in tips:
+        if tip in seen:
+            continue
+        seen.add(tip)
+        unique.append(tip)
+    return unique
+
+
+def draw_tip_banner(image, coaching_tips: list[str]) -> int:
+    if not coaching_tips:
+        return 18
+
+    height, width = image.shape[:2]
+    x0 = 18
+    y0 = 18
+    x1 = width - 18
+    header_height = 34
+    line_height = 28
+    padding = 16
+    banner_height = padding * 2 + header_height + len(coaching_tips) * line_height
+    y1 = min(height - 18, y0 + banner_height)
+
+    overlay = image.copy()
+    cv.rectangle(overlay, (x0, y0), (x1, y1), (0, 0, 0), -1)
+    cv.addWeighted(overlay, 0.48, image, 0.52, 0, image)
+
+    text_x = x0 + 16
+    draw_text_box(image, "Tips", (text_x, y0 + 30))
+    for offset, tip in enumerate(coaching_tips[:MAX_COACHING_TIPS]):
+        draw_text_box(image, f"- {tip}", (text_x, y0 + 30 + (offset + 1) * line_height))
+
+    return y1
+
+
 def draw_text_box(image, text: str, origin: tuple[int, int]):
     x, y = origin
     cv.putText(image, text, (x, y), cv.FONT_HERSHEY_SIMPLEX, 0.7, TEXT_BG, 6, cv.LINE_AA)
     cv.putText(image, text, (x, y), cv.FONT_HERSHEY_SIMPLEX, 0.7, TEXT_COLOR, 2, cv.LINE_AA)
 
 
-def draw_metrics_panel(image, metrics: dict[str, Optional[float]], swing_sides: SwingSides):
+def draw_metrics_panel(
+    image,
+    metrics: dict[str, Optional[float]],
+    swing_sides: SwingSides,
+    top_offset: int = 18,
+):
     height, width = image.shape[:2]
-    panel_width = 422
-    panel_height = 202
+    panel_width = 460
+    panel_height = 220
     x1 = width - 18
-    y1 = 18
+    y1 = top_offset
     x0 = max(18, x1 - panel_width)
     y2 = min(height - 18, y1 + panel_height)
 
@@ -321,12 +470,20 @@ def open_writer(output_path: Path, fps: float, size: tuple[int, int]):
     raise RuntimeError(f"Could not open a video writer for {output_path}")
 
 
-def process_video(input_path: Path, output_path: Path, model_path: Path, right_handed: Optional[bool]):
+def process_video(
+    input_path: Path,
+    output_path: Path,
+    model_path: Path,
+    right_handed: Optional[bool],
+    slowdown: float,
+):
     capture = cv.VideoCapture(str(input_path))
     if not capture.isOpened():
         raise RuntimeError(f"Could not open input video: {input_path}")
 
-    fps = capture.get(cv.CAP_PROP_FPS) or 30.0
+    source_fps = capture.get(cv.CAP_PROP_FPS) or 30.0
+    slowdown = max(1.0, slowdown)
+    fps = max(1.0, source_fps / slowdown)
     capture.set(cv.CAP_PROP_ORIENTATION_AUTO, 0) if hasattr(cv, "CAP_PROP_ORIENTATION_AUTO") else None
 
     with build_landmarker(model_path) as landmarker:
@@ -341,6 +498,7 @@ def process_video(input_path: Path, output_path: Path, model_path: Path, right_h
             frame_index = 0
             capture.set(cv.CAP_PROP_POS_FRAMES, 0)
             swing_sides: Optional[SwingSides] = None
+            tip_tracker = StickyTipTracker()
 
             while True:
                 success, frame = capture.read()
@@ -357,11 +515,20 @@ def process_video(input_path: Path, output_path: Path, model_path: Path, right_h
                 if swing_sides is None:
                     swing_sides = SwingSides(lead="left", trail="right")
 
+                pose_is_valid = bool(result.pose_landmarks) and assess_pose_quality(result.pose_landmarks[0])
+                candidate_tips: Optional[list[str]] = None
+                metrics = None
+                if pose_is_valid:
+                    metrics = calculate_metrics(result.pose_landmarks[0], swing_sides)
+                    candidate_tips = derive_coaching_tips(metrics, swing_sides)
+
+                sticky_tips = tip_tracker.update(candidate_tips)
+
                 annotated = build_pose_canvas(frame, result, swing_sides)
                 annotated = cv.rotate(annotated, cv.ROTATE_90_CLOCKWISE)
-                if result.pose_landmarks:
-                    metrics = calculate_metrics(result.pose_landmarks[0], swing_sides)
-                    draw_metrics_panel(annotated, metrics, swing_sides)
+                tip_bottom = draw_tip_banner(annotated, sticky_tips)
+                if metrics is not None:
+                    draw_metrics_panel(annotated, metrics, swing_sides, top_offset=tip_bottom + 12)
                 writer.write(annotated)
                 frame_index += 1
         finally:
@@ -387,7 +554,7 @@ def main() -> int:
         raise SystemExit(f"Input video not found: {args.input_video}")
 
     model_path = ensure_model_file(args.model)
-    process_video(args.input_video, args.output, model_path, right_handed)
+    process_video(args.input_video, args.output, model_path, right_handed, args.slowdown)
     print(f"Wrote annotated video to {args.output}")
     return 0
 
